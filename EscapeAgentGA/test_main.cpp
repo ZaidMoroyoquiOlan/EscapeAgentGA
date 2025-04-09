@@ -2,13 +2,27 @@
 #include "EscapeAgentGA.h"
 #include "gene.h"
 
+// This file is not important it is just used for testing
 int main() {
     std::cout << "Running test executable." << std::endl;
-    Gene* array = (Gene*)malloc(1 * 10 * sizeof(Gene));
+    int sizeOfChromosome = 5;
+    Gene* array = (Gene*)malloc(sizeOfChromosome * sizeof(Gene));
 
-    RunCUDAGA(array);
+    float* sourcePos = (float*)malloc(2 * sizeof(float));
+    sourcePos[0] = 0.0f;
+    sourcePos[1] = 0.0f;
 
-    for (int i = 0; i < 10; i++) {
+    float* sourceVel = (float*)malloc(2 * sizeof(float));
+    sourceVel[0] = 0.0f;
+    sourceVel[1] = 0.0f;
+
+    float* targetPos = (float*)malloc(2 * sizeof(float));
+    targetPos[0] = 0.0f;
+    targetPos[1] = 0.0f;
+
+    RunCUDAGA(array, sourcePos, sourceVel, 0.0f, targetPos, sizeOfChromosome);
+
+    for (int i = 0; i < sizeOfChromosome; i++) {
         std::cout << i << " " << array[i].throttle << " " << array[i].direction << std::endl;
     }
 
