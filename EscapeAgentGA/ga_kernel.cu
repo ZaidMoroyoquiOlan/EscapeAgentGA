@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include <curand_kernel.h>
 #include "ga_kernel.cuh"
 #include "gene.h"
@@ -41,26 +43,10 @@ __device__ float GetWheelTorque(float engineTorque, float gearRatio, float final
     return engineTorque * gearRatio * finalDriveRatio * 0.9f;
 }
 
-__global__ void createRandomChromosome(Gene* arr, int N, int M, int seed) {
+__global__ void EvaluateChromosome(Gene* chromosomes, float* fitness, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int NChromosomes, int NActions) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= N) return;
-
-    // Calculate the starting index for each thread's array
-    Gene* threadArray = arr + idx * M;
-
-    // Initialize cuRAND state for each thread
-    curandState state;
-    curand_init(seed, idx, 0, &state);
-
-    for (int i = 0; i < M; i++) {
-        threadArray[i].direction = 2.0f * curand_uniform(&state) - 1.0f;
-        threadArray[i].throttle = curand_uniform(&state);
-    }
-}
-
-__global__ void EvaluateChromosomeKernel(Gene* chromosomes, float* results, float* sourcePos, float* sourceVel, float heading, float* targetPos, int NChromosomes, int NActions) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-
+    if (idx >= NChromosomes) return;
+    
     Gene* chromosome = &chromosomes[idx * NActions];
     float x = sourcePos[0], y = sourcePos[1];
     float vx = sourceVel[0], vy = sourceVel[1];
@@ -110,50 +96,184 @@ __global__ void EvaluateChromosomeKernel(Gene* chromosomes, float* results, floa
             y += vy * dt;
         }
     }
-    // Distancia final a target
-    float dx = x - targetPos[0];
-    float dy = y - targetPos[1];
-    results[idx] = sqrtf(dx * dx + dy * dy);
+    // Facing
+    float dx = targetPos[0] - x;
+    float dy = targetPos[1] - y;
+    float toTargetMag = sqrtf(dx * dx + dy * dy);
+
+    if (toTargetMag > 1e-5f) {
+        dx /= toTargetMag;
+        dy /= toTargetMag;
+    }
+
+    float facingX = cosf(carAngle);
+    float facingY = sinf(carAngle);
+
+    float tFacingX = cosf(carAngle);
+    float tFacingY = sinf(carAngle);
+
+    // Looking at another direction away from where target is facing
+    float dot = fmaxf(-1.0f, fminf(1.0f, tFacingX * facingX + tFacingY * facingY));
+    float angleFactor = acosf(dot) / 3.14159265f;
+
+    // Looking at another direction away from where target is at
+    dot = fmaxf(-1.0f, fminf(1.0f, dx * facingX + dy * facingY));
+    float angleLocationFactor = acosf(dot) / 3.14159265f;
+
+    fitness[idx] = angleFactor*(toTargetMag / 100.0f) + 30*angleLocationFactor;
 }
 
-void generatePopulation(Gene *h_arr, int N, int M) {
-    Gene *d_arr;
-    size_t size = N * M * sizeof(Gene);
+__global__ void InitializePopulation(Gene* d_Chromosomes, curandState* states, int NChromosomes, int NActions) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < NChromosomes) {
+        curandState localState = states[idx];
 
-    cudaMalloc((void**) &d_arr, size);
-
-    createRandomChromosome<<<1, N>>>(d_arr, N, M, time(NULL));
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(h_arr, d_arr, size, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_arr);
+        for (int i = 0; i < NActions; i++) {
+            d_Chromosomes[idx * NActions + i].throttle = curand_uniform(&localState); // [0,1]
+            d_Chromosomes[idx * NActions + i].direction = curand_uniform(&localState) * 2.0f - 1.0f; // [-1,1]
+        }
+        states[idx] = localState;
+    }
 }
 
-void EvaluateChromosomes(Gene* h_Chromosomes, float* h_Results, float* h_sourcePos, float* h_sourceVel, float heading, float *h_targetPos, int NChromosomes, int NActions) {
-    Gene* d_Chromosomes;
-    float* d_Results, *d_sourcePos, *d_sourceVel, *d_targetPos;
-    size_t size = NChromosomes * NActions * sizeof(Gene);
+__global__ void InitRandomStates(curandState* states, unsigned long seed, int NChromosomes) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < NChromosomes) {
+        curand_init(seed, idx, 0, &states[idx]);
+    }
+}
 
-    cudaMalloc((void**) &d_Chromosomes, size);
-    cudaMalloc((void**) &d_Results, NChromosomes * sizeof(float));
-    cudaMalloc((void**) &d_sourcePos, 2 * sizeof(float));
-    cudaMalloc((void**) &d_sourceVel, 2 * sizeof(float));
-    cudaMalloc((void**) &d_targetPos, 2 * sizeof(float));
+__device__ int Ranking(Gene* current_genes, Gene* new_genes, int chromo_index, float* fitness, curandState* state, int num_chromosomes, int num_genes) {
+    int r1 = curand(state) % num_chromosomes;
+    int r2;
 
-    cudaMemcpy(d_Chromosomes, h_Chromosomes, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sourcePos, h_sourcePos, 2 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sourceVel, h_sourceVel, 2 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targetPos, h_targetPos, 2 * sizeof(float), cudaMemcpyHostToDevice);
+    for (int i = 0; i < (num_chromosomes / 2); i++) {
+        r2 = curand(state) % num_chromosomes;
+        if (fitness[r1] < fitness[r2]) {
+            r1 = r2;
+        }
+    }
+    for (int i = 0; i < num_genes; i++) {
+        new_genes[chromo_index + i] = current_genes[r1 + i];
+    }
 
-    EvaluateChromosomeKernel<<<1, NChromosomes>>>(d_Chromosomes, d_Results, d_sourcePos, d_sourceVel, heading, d_targetPos, NChromosomes, NActions);
+    return r1;
+}
+
+__device__ void Crossover(Gene* current_genes, Gene* new_genes, int parent1, int parent2, int base_index, int split, int NActions) {
+    for (int i = 0; i < NActions; i++) {
+        new_genes[base_index + i] = (i < split) ? current_genes[parent1 + i] : current_genes[parent2 + i];
+    }
+}
+
+__device__ void Mutate(Gene* genes, int chromo_index, float mutation_rate, curandState* state, int NActions) {
+    for (int i = 0; i < NActions; i++) {
+        if (curand_uniform(state) < mutation_rate) {
+            genes[chromo_index + i].throttle = curand_uniform(state);
+            genes[chromo_index + i].direction = curand_uniform(state) * 2.0f - 1.0f;
+        }
+    }
+}
+
+__global__ void Recombination(Gene* d_Population, Gene* d_NewPopulation, float* fitness, curandState* states, int NChromosomes, int NActions) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx < NChromosomes / 4) {
+        curandState localState = states[idx];
+
+        int base = idx * 4;
+
+        // Los padres son insertados directamente en la nueva generación
+        int parent1 = Ranking(d_Population, d_NewPopulation, base, fitness, &localState, NChromosomes, NActions);
+        int parent2 = Ranking(d_Population, d_NewPopulation, base + NActions, fitness, &localState, NChromosomes, NActions);
+
+        // Los hijos son insertados directamente en la nueva generación
+        int split = curand(&localState) % NActions;
+        Crossover(d_Population, d_NewPopulation, parent1, parent2, base + 2 * NActions, split, NActions);
+        Crossover(d_Population, d_NewPopulation, parent2, parent1, base + 3 * NActions, split, NActions);
+
+        Mutate(d_NewPopulation, base + 2 * NActions, 0.1f, &localState, NActions);
+        Mutate(d_NewPopulation, base + 3 * NActions, 0.1f, &localState, NActions);
+
+        states[idx] = localState;
+    }
+}
+
+__global__ void getBestSolution(Gene* chromosomes, float* fitness, Gene* d_bestSolution, float *bestFitness, int NChromosomes, int NActions) {
+    int best = 0; 
+
+    for (int i = 1; i < NChromosomes; i++) {
+        if (fitness[i] > fitness[best]) {
+            best = i;
+        }
+    }
+
+    if (fitness[best] > *bestFitness) {
+        *bestFitness = fitness[best];
+
+        for (int i = 0; i < NActions; i++) {
+            d_bestSolution[i] = chromosomes[best*NActions + i];
+        }
+    }
+    printf("Best solution[%d]: %f", best, *bestFitness);
+}
+
+void ExecuteGA(Gene* solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int NChromosomes, int NActions, int NGenerations) {
+    size_t populationSize = NChromosomes * NActions * sizeof(Gene);
+
+    Gene* d_Population, *d_NewPopulation, *d_BestSolution;
+    cudaMalloc((void **) &d_Population, populationSize);
+    cudaMalloc((void **) &d_NewPopulation, populationSize);
+    cudaMalloc((void**) &d_BestSolution, NActions * sizeof(Gene));
+
+    float* fitness, *bestFitness, h_bestFitness = 0.0f;
+    float* d_sourcePos, *d_sourceVel, *d_targetPos;
+    cudaMalloc((void**) &fitness, NChromosomes * sizeof(float));
+    cudaMalloc((void**) &bestFitness, sizeof(float));
+    cudaMalloc((void**) &d_sourcePos, 2*sizeof(float));
+    cudaMalloc((void**) &d_sourceVel, 2*sizeof(float));
+    cudaMalloc((void**) &d_targetPos, 2*sizeof(float));
+
+    cudaMemcpy(bestFitness, &h_bestFitness, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sourcePos, sourcePos, 2*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sourceVel, sourceVel, 2*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_targetPos, targetPos, 2*sizeof(float), cudaMemcpyHostToDevice);
+
+    curandState* states;
+    cudaMalloc(&states, NChromosomes * sizeof(curandState));
+    InitRandomStates<<<1, NChromosomes>>>(states, time(NULL), NChromosomes);
     cudaDeviceSynchronize();
 
-    cudaMemcpy(h_Results, d_Results, NChromosomes * sizeof(float), cudaMemcpyDeviceToHost);
+    InitializePopulation<<<1, NChromosomes>>>(d_Population, states, NChromosomes, NActions);
+    cudaDeviceSynchronize();
 
-    cudaFree(d_Chromosomes);
+    EvaluateChromosome<<<1, NChromosomes>>>(d_Population, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
+    cudaDeviceSynchronize();
+
+    getBestSolution<<<1,1>>>(d_Population, fitness, d_BestSolution, bestFitness, NChromosomes, NActions);
+    cudaDeviceSynchronize();
+
+    for (int g = 0; g < NGenerations; g++) {
+        Recombination<<<1, NChromosomes>>>(d_Population, d_NewPopulation, fitness, states, NChromosomes, NActions);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(d_Population, d_NewPopulation, populationSize, cudaMemcpyDeviceToDevice);
+
+        EvaluateChromosome<<<1, NChromosomes>>>(d_Population, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
+        cudaDeviceSynchronize();
+
+        getBestSolution<<<1,1>>>(d_Population, fitness, d_BestSolution, bestFitness, NChromosomes, NActions);
+        cudaDeviceSynchronize();
+    }
+    cudaMemcpy(solution, d_BestSolution, NActions * sizeof(Gene), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_Population);
+    cudaFree(d_NewPopulation);
+    cudaFree(d_BestSolution);
     cudaFree(d_sourcePos);
     cudaFree(d_sourceVel);
     cudaFree(d_targetPos);
-    cudaFree(d_Results);
+    cudaFree(bestFitness);
+    cudaFree(fitness);
+    cudaFree(states);
 }

@@ -15,5 +15,5 @@
 #endif
 
 extern "C" {
-    ESCAPEAGENTGA_API void RunCUDAGA(Gene* solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, int m);  // Function exposed by the DLL
+    ESCAPEAGENTGA_API void RunCUDAGA(Gene* solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int m);  // Function exposed by the DLL
 }
