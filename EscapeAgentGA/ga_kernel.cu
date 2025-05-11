@@ -18,6 +18,10 @@
 __constant__ float gearRatios[7] = { 3.75, 2.38, 1.72, 1.34, 1.11, 0.96, 0.84 };
 __constant__ float changeRatio[7] = { 0, 8.05, 13.33, 17.22, 18.88, 26.11, 30.0 };
 
+// Variables para el mapa
+static uint8_t* d_Map = nullptr;
+static int mapSize;
+
 __device__ int GetCurrentGear(float speed, int numGears) {
     for (int i = 0; i < numGears; i++) {
         if (speed < changeRatio[i + 1]) {
@@ -215,7 +219,26 @@ __global__ void getBestSolution(Gene* chromosomes, float* fitness, Gene* d_bestS
             d_bestSolution[i] = chromosomes[best*NActions + i];
         }
     }
-    printf("Best solution[%d]: %f", best, *bestFitness);
+    //printf("Best solution[%d]: %f\n", best, *bestFitness);
+}
+
+// Example of use
+__global__ void viewMap(uint8_t* map, int size) {
+    printf("size: %d", size);
+    if (size < 0) return;
+    for (int i = 0; i < size; i++)
+    {
+        printf("%d, ", map[i]);
+    }
+    printf("\n");
+}
+
+bool checkCudaError(cudaError_t err) {
+    if (err != cudaSuccess) {
+        printf("cudaMalloc failed: %s", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 void ExecuteGA(Gene* solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int NChromosomes, int NActions, int NGenerations) {
@@ -276,4 +299,15 @@ void ExecuteGA(Gene* solution, float* sourcePos, float* sourceVel, float heading
     cudaFree(bestFitness);
     cudaFree(fitness);
     cudaFree(states);
+}
+
+void AllocateMap(const uint8_t* h_Map, int size) {
+    cudaMalloc(&d_Map, size);
+    cudaMemcpy(d_Map, h_Map, size, cudaMemcpyHostToDevice);
+    mapSize = size;
+}
+
+void FreeMap() {
+    cudaFree(d_Map);
+    mapSize = 0;
 }
