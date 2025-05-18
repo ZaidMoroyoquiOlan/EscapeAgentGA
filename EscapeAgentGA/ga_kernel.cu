@@ -6,6 +6,12 @@
 #include "ga_kernel.cuh"
 #include "gene.h"
 
+// Esto debe asignarse dinámicamente
+#define mapX 300
+#define mapY 300
+#define mapN 15000
+#define mapM 15000
+
 #define PI 3.14159265359f
 #define wheel_base 250.0f     // cm
 #define max_speed 3000.0f     // cm/s
@@ -21,6 +27,15 @@ __constant__ float changeRatio[7] = { 0, 8.05, 13.33, 17.22, 18.88, 26.11, 30.0 
 // Variables para el mapa
 static uint8_t* d_Map = nullptr;
 static int mapSize;
+
+__device__ int clamp(float x, int a, int b, int n) {
+    if (a == b) return 0; // evitar división por cero
+    float t = (x - (float)a) / (float)(b - a);
+    int scaled = (int)(t * n + 0.5f); // redondeo
+    if (scaled < 0) return 0;
+    if (scaled > n) return n;
+    return scaled;
+}
 
 __device__ int GetCurrentGear(float speed, int numGears) {
     for (int i = 0; i < numGears; i++) {
@@ -47,7 +62,9 @@ __device__ float GetWheelTorque(float engineTorque, float gearRatio, float final
     return engineTorque * gearRatio * finalDriveRatio * 0.9f;
 }
 
-__global__ void EvaluateChromosome(Gene* chromosomes, float* fitness, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int NChromosomes, int NActions) {
+__global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, float* fitness, 
+                                    float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, 
+                                    int NChromosomes, int NActions) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx >= NChromosomes) return;
     
@@ -57,10 +74,19 @@ __global__ void EvaluateChromosome(Gene* chromosomes, float* fitness, float* sou
     float speed;
     float carAngle = heading;
     int currentGear;
+    int colisions = 0;
+    int reverses = 0;  
 
     for (int i = 0; i < NActions; i++) {
         float throttle = chromosome[i].throttle; // Valor de [0 to 1.0]
         float direction = chromosome[i].direction; // Valor de [-1.0 to 1.0]
+
+        // Evitar soluciones que conducen al revés
+        if (chromosome[i].throttle < 0) reverses++;
+        if (reverses > NActions / 2) {
+            fitness[idx] = 0.0f;
+            return;
+        }
 
         // Girar el vehículo en radianes utilizando el modelo Angle-ratio
         float steeringAngle = 0.7f * direction * (3.14159265359f / 180.0f) * max_steering_deg;
@@ -98,9 +124,14 @@ __global__ void EvaluateChromosome(Gene* chromosomes, float* fitness, float* sou
             // Actualizar posición
             x += vx * dt;
             y += vy * dt;
+            int cx = clamp(x, -mapN, mapN, mapX);
+            int cy = clamp(y, -mapM, mapM, mapY);
+            if (cy * mapX + cx < size && map[cy * mapX + cx]) {
+                colisions++;
+            }
         }
     }
-    // Facing
+    // Obtener la distancia entre el vehículo y el objetivo
     float dx = targetPos[0] - x;
     float dy = targetPos[1] - y;
     float toTargetMag = sqrtf(dx * dx + dy * dy);
@@ -110,21 +141,27 @@ __global__ void EvaluateChromosome(Gene* chromosomes, float* fitness, float* sou
         dy /= toTargetMag;
     }
 
+    // Obtener hacia donde mira el vehículo
     float facingX = cosf(carAngle);
     float facingY = sinf(carAngle);
 
-    float tFacingX = cosf(carAngle);
-    float tFacingY = sinf(carAngle);
+    // Obtener hacia donde mira el objetivo
+    float tFacingX = cosf(targetHeading);
+    float tFacingY = sinf(targetHeading);
 
-    // Looking at another direction away from where target is facing
+    // Favorecer soluciones que miran en dirección opuesta de donde mira el objetivo
     float dot = fmaxf(-1.0f, fminf(1.0f, tFacingX * facingX + tFacingY * facingY));
     float angleFactor = acosf(dot) / 3.14159265f;
 
-    // Looking at another direction away from where target is at
+    // Favorecer soluciones que miran en dirección opuesta de donde está el objetivo
     dot = fmaxf(-1.0f, fminf(1.0f, dx * facingX + dy * facingY));
     float angleLocationFactor = acosf(dot) / 3.14159265f;
 
-    fitness[idx] = angleFactor*(toTargetMag / 100.0f) + 30*angleLocationFactor;
+    // Favorecer soluciones con una velocidad
+    speed = sqrtf(vx * vx + vy * vy);
+    float speedFactor = expf(-powf(speed - 2200.0f, 2) / (2 * 225.0f * 225.0f));
+    // Función de fitness
+    fitness[idx] = angleFactor * (toTargetMag / 100.0f) + 30 * angleLocationFactor - colisions * 2.0f + speedFactor*5.0f;
 }
 
 __global__ void InitializePopulation(Gene* d_Chromosomes, curandState* states, int NChromosomes, int NActions) {
@@ -133,7 +170,7 @@ __global__ void InitializePopulation(Gene* d_Chromosomes, curandState* states, i
         curandState localState = states[idx];
 
         for (int i = 0; i < NActions; i++) {
-            d_Chromosomes[idx * NActions + i].throttle = curand_uniform(&localState); // [0,1]
+            d_Chromosomes[idx * NActions + i].throttle = curand_uniform(&localState) * 2.0f - 1.0f; // [0,1]
             d_Chromosomes[idx * NActions + i].direction = curand_uniform(&localState) * 2.0f - 1.0f; // [-1,1]
         }
         states[idx] = localState;
@@ -173,7 +210,7 @@ __device__ void Crossover(Gene* current_genes, Gene* new_genes, int parent1, int
 __device__ void Mutate(Gene* genes, int chromo_index, float mutation_rate, curandState* state, int NActions) {
     for (int i = 0; i < NActions; i++) {
         if (curand_uniform(state) < mutation_rate) {
-            genes[chromo_index + i].throttle = curand_uniform(state);
+            genes[chromo_index + i].throttle = curand_uniform(state) * 2.0f - 1.0f;
             genes[chromo_index + i].direction = curand_uniform(state) * 2.0f - 1.0f;
         }
     }
@@ -242,6 +279,8 @@ bool checkCudaError(cudaError_t err) {
 }
 
 void ExecuteGA(Gene* solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int NChromosomes, int NActions, int NGenerations) {
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (NChromosomes + threadsPerBlock - 1) / threadsPerBlock;
     size_t populationSize = NChromosomes * NActions * sizeof(Gene);
 
     Gene* d_Population, *d_NewPopulation, *d_BestSolution;
@@ -264,25 +303,25 @@ void ExecuteGA(Gene* solution, float* sourcePos, float* sourceVel, float heading
 
     curandState* states;
     cudaMalloc(&states, NChromosomes * sizeof(curandState));
-    InitRandomStates<<<1, NChromosomes>>>(states, time(NULL), NChromosomes);
+    InitRandomStates<<<blocksPerGrid, threadsPerBlock >>>(states, time(NULL), NChromosomes);
     cudaDeviceSynchronize();
 
-    InitializePopulation<<<1, NChromosomes>>>(d_Population, states, NChromosomes, NActions);
+    InitializePopulation<<<blocksPerGrid, threadsPerBlock>>>(d_Population, states, NChromosomes, NActions);
     cudaDeviceSynchronize();
 
-    EvaluateChromosome<<<1, NChromosomes>>>(d_Population, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
+    EvaluateChromosome<<<blocksPerGrid, threadsPerBlock>>>(d_Population, d_Map, mapSize, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
     cudaDeviceSynchronize();
 
     getBestSolution<<<1,1>>>(d_Population, fitness, d_BestSolution, bestFitness, NChromosomes, NActions);
     cudaDeviceSynchronize();
 
     for (int g = 0; g < NGenerations; g++) {
-        Recombination<<<1, NChromosomes>>>(d_Population, d_NewPopulation, fitness, states, NChromosomes, NActions);
+        Recombination<<<blocksPerGrid, threadsPerBlock>>>(d_Population, d_NewPopulation, fitness, states, NChromosomes, NActions);
         cudaDeviceSynchronize();
 
         cudaMemcpy(d_Population, d_NewPopulation, populationSize, cudaMemcpyDeviceToDevice);
 
-        EvaluateChromosome<<<1, NChromosomes>>>(d_Population, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
+        EvaluateChromosome<<<blocksPerGrid, threadsPerBlock>>>(d_Population, d_Map, mapSize, fitness, d_sourcePos, d_sourceVel, heading, d_targetPos, targetHeading, NChromosomes, NActions);
         cudaDeviceSynchronize();
 
         getBestSolution<<<1,1>>>(d_Population, fitness, d_BestSolution, bestFitness, NChromosomes, NActions);

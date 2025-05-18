@@ -14,7 +14,7 @@ ESCAPEAGENTGA_API void InitCudaArray(const uint8_t* binArray, size_t size) {
 
 // Solution is the output, m is the size of the chromosome
 ESCAPEAGENTGA_API void RunCUDAGA(Gene *solution, float* sourcePos, float* sourceVel, float heading, float* targetPos, float targetHeading, int m) {
-	int n = 256; // Size of population
+	int n = 512; // Size of population
 	int Generations = 100;
 
 	ExecuteGA(solution, sourcePos, sourceVel, heading, targetPos, targetHeading, n, m, Generations);
