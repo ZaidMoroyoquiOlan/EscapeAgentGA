@@ -48,7 +48,7 @@ __device__ int GetCurrentGear(float speed, int numGears) {
 
 __device__ float GetTorqueFromRPM(float rpm, float maxTorque, float maxRPM) {
     float peakRPM = maxRPM * 0.7f;
-    float normalized = (rpm - peakRPM) / (maxRPM * 0.45f);
+    float normalized = (rpm - peakRPM) / (maxRPM * 0.35f);
     float torqueFactor = expf(-normalized * normalized);
     return maxTorque * torqueFactor;
 }
@@ -75,18 +75,18 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
     float carAngle = heading;
     int currentGear;
     int colisions = 0;
-    int reverses = 0;  
+    int positiveThrottles = 0;  
 
     for (int i = 0; i < NActions; i++) {
         float throttle = chromosome[i].throttle; // Valor de [0 to 1.0]
         float direction = chromosome[i].direction; // Valor de [-1.0 to 1.0]
 
         // Evitar soluciones que conducen al revés
-        if (chromosome[i].throttle < 0) reverses++;
-        if (reverses > NActions / 2) {
+        if (chromosome[i].throttle > 0.0f) positiveThrottles++;
+        /*if (reverses > NActions / 2) {
             fitness[idx] = 0.0f;
             return;
-        }
+        }*/
 
         // Girar el vehículo en radianes utilizando el modelo Angle-ratio
         float steeringAngle = 0.7f * direction * (3.14159265359f / 180.0f) * max_steering_deg;
@@ -128,6 +128,8 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
             int cy = clamp(y, -mapM, mapM, mapY);
             if (cy * mapX + cx < size && map[cy * mapX + cx]) {
                 colisions++;
+                vx *= 0.2;
+                vy *= 0.2;
             }
         }
     }
@@ -159,9 +161,13 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
 
     // Favorecer soluciones con una velocidad
     speed = sqrtf(vx * vx + vy * vy);
-    float speedFactor = expf(-powf(speed - 2200.0f, 2) / (2 * 225.0f * 225.0f));
+    float speedFactor = expf(-powf(speed - 2500.0f, 2) / (2 * 300.0f * 300.0f));
     // Función de fitness
-    fitness[idx] = angleFactor * (toTargetMag / 100.0f) + 30 * angleLocationFactor - colisions * 2.0f + speedFactor*5.0f;
+    fitness[idx] = toTargetMag / 100.0f + 10.0f * angleLocationFactor + 10.0f * angleFactor;
+    if (colisions <= 0)
+        fitness[idx] += positiveThrottles * 10.0f + speedFactor * 10.0f;
+    else
+        fitness[idx] -= colisions * colisions - 10.0f*(NActions - positiveThrottles);
 }
 
 __global__ void InitializePopulation(Gene* d_Chromosomes, curandState* states, int NChromosomes, int NActions) {

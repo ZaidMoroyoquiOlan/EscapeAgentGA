@@ -27,7 +27,7 @@ int main() {
     const size_t binSize = 252*250;
     std::vector<uint8_t> binArray(binSize);
     for (size_t i = 0; i < binSize; ++i) {
-        binArray[i] = static_cast<uint8_t>(1);
+        binArray[i] = static_cast<uint8_t>(0);
     }
 
     // Medir tiempo de ejecución
