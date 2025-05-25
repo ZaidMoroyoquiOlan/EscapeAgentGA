@@ -15,7 +15,7 @@
 #define PI 3.14159265359f
 #define wheel_base 250.0f     // cm
 #define max_speed 3000.0f     // cm/s
-#define max_steering_deg 45.0f
+#define max_steering_deg 34.861f
 #define max_torque 300.0f     // N
 #define tire_radius 0.36f     // m
 #define dt 0.1f
@@ -38,19 +38,29 @@ __device__ int clamp(float x, int a, int b, int n) {
 }
 
 __device__ int GetCurrentGear(float speed, int numGears) {
-    for (int i = 0; i < numGears; i++) {
+    for (int i = 0; i < numGears - 1; i++) {
         if (speed < changeRatio[i + 1]) {
             return i;
         }
     }
-    return 0;
+    return numGears - 1;
 }
 
 __device__ float GetTorqueFromRPM(float rpm, float maxTorque, float maxRPM) {
-    float peakRPM = maxRPM * 0.7f;
-    float normalized = (rpm - peakRPM) / (maxRPM * 0.35f);
-    float torqueFactor = expf(-normalized * normalized);
-    return maxTorque * torqueFactor;
+    const float peak_rpm = maxRPM * 0.256f;
+    float torque_factor;
+
+    if (rpm <= peak_rpm) {
+        // Lado ascendente
+        float normalized = rpm / peak_rpm;
+        torque_factor = expf(-((1.0f - normalized) * (1.0f - normalized)) * 2.334f);
+    }
+    else {
+        // Lado descendente
+        float normalized = (rpm - peak_rpm) / (maxRPM - peak_rpm);
+        torque_factor = expf(-(normalized * normalized) * 4.327f);
+    }
+    return maxTorque * torque_factor;
 }
 
 __device__ float GetEngineRPM(float speed, float gearRatio, float finalDriveRatio, float wheelRadius) {
@@ -71,7 +81,7 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
     Gene* chromosome = &chromosomes[idx * NActions];
     float x = sourcePos[0], y = sourcePos[1];
     float vx = sourceVel[0], vy = sourceVel[1];
-    float speed;
+    float speed = sqrtf(vx * vx + vy * vy);
     float carAngle = heading;
     int currentGear;
     int colisions = 0;
@@ -83,16 +93,12 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
 
         // Evitar soluciones que conducen al revés
         if (chromosome[i].throttle > 0.0f) positiveThrottles++;
-        /*if (reverses > NActions / 2) {
-            fitness[idx] = 0.0f;
-            return;
-        }*/
 
         // Girar el vehículo en radianes utilizando el modelo Angle-ratio
-        float steeringAngle = 0.7f * direction * (3.14159265359f / 180.0f) * max_steering_deg;
+        float steeringAngle = 0.669f * direction * (3.14159265359f / 180.0f) * max_steering_deg;
 
         for (int j = 0; j < steps_per_second; j++) {
-            speed = sqrtf(vx * vx + vy * vy);
+            // Físicas del motor
             currentGear = GetCurrentGear(speed / 100.0, 7);
 
             float engineRPM = GetEngineRPM(speed / 100.0, gearRatios[currentGear], 3.97, tire_radius);
@@ -104,32 +110,21 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
             float acceleration = 100 * driveForce / 1500.0f; // cm/s^2
 
             float dv = acceleration * dt;
+            speed += dv;
+            speed = fminf(speed, max_speed);
 
-            // Actualizar velocidad basado en dirección
-            if (fabsf(steeringAngle) < 0.001f) {
-                // Move straight
-                vx += dv * cosf(carAngle);
-                vy += dv * sinf(carAngle);
-            }
-            else {
-                // Girar utilizando el modelo de bicicleta
-                float turningRadius = wheel_base / tanf(steeringAngle);
-                float angularVelocity = speed / turningRadius; // radians/sec
-                carAngle += angularVelocity * dt;
-
-                vx += dv * cosf(carAngle);
-                vy += dv * sinf(carAngle);
-            }
+            float limited_steering_angle = steeringAngle * (1.0f - fminf(1.0f, speed / max_speed));
+            carAngle += (speed / wheel_base) * tanf(limited_steering_angle) * dt;
 
             // Actualizar posición
-            x += vx * dt;
-            y += vy * dt;
+            x += speed * cosf(carAngle) * dt;
+            y += speed * sinf(carAngle) * dt;
+            
             int cx = clamp(x, -mapN, mapN, mapX);
             int cy = clamp(y, -mapM, mapM, mapY);
             if (cy * mapX + cx < size && map[cy * mapX + cx]) {
                 colisions++;
-                vx *= 0.2;
-                vy *= 0.2;
+                speed *= 0.2f;
             }
         }
     }
@@ -160,8 +155,8 @@ __global__ void EvaluateChromosome(Gene* chromosomes, uint8_t* map, int size, fl
     float angleLocationFactor = acosf(dot) / 3.14159265f;
 
     // Favorecer soluciones con una velocidad
-    speed = sqrtf(vx * vx + vy * vy);
     float speedFactor = expf(-powf(speed - 2500.0f, 2) / (2 * 300.0f * 300.0f));
+
     // Función de fitness
     fitness[idx] = toTargetMag / 100.0f + 10.0f * angleLocationFactor + 10.0f * angleFactor;
     if (colisions <= 0)
